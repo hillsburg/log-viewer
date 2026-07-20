@@ -3,8 +3,11 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -38,6 +41,9 @@ public partial class App : Application
 {
     // ========== 状态字段 ==========
     private NotifyIcon _trayIcon = null!;
+    private ContextMenuStrip? _contextMenu;
+    private Font? _menuFont;
+    private Font? _menuFontBold;
     private Process? _backendProcess;
     private DispatcherTimer _statusTimer = null!;
     private int _crashRestartCount;
@@ -49,7 +55,10 @@ public partial class App : Application
     private Icon? _iconGray;
     private Icon? _iconGreen;
     private Icon? _iconRed;
+    /// <summary>当前交给 NotifyIcon 的克隆实例（与模板分离，避免句柄被重复释放）</summary>
+    private Icon? _assignedTrayIcon;
     private bool _hasOpenedBrowserOnStart;
+    private string _serviceUrl = $"http://127.0.0.1:{DefaultPort}";
     private static readonly HttpClient HealthClient = new()
     {
         Timeout = TimeSpan.FromSeconds(2)
@@ -58,16 +67,22 @@ public partial class App : Application
     // ========== 配置常量 ==========
     private static readonly string BackendExeName = "LogViewer.Api.exe";
     private static readonly string BackendProcessName = "LogViewer.Api";
-    private static readonly string ServiceUrl = "http://localhost:5173";
-    private static readonly string AdminUrl = "http://localhost:5173/admin.html";
+    private const int DefaultPort = 5173;
+    private const int PortScanRange = 100;
     private const string WatchdogArg = "--watchdog";
     private const string LaunchedByTrayEnv = "LOGVIEWER_LAUNCHED_BY_TRAY";
     private static readonly string CleanExitMarkerPath = Path.Combine(
         Path.GetTempPath(), "LogViewer.Launcher.clean-exit");
 
+    private string ServiceUrl => _serviceUrl;
+    private string AdminUrl => $"{_serviceUrl.TrimEnd('/')}/admin.html";
+
     /// <summary>后端 exe 路径：启动器所在目录的 server/ 子目录</summary>
     private string BackendExePath => Path.Combine(
         AppDomain.CurrentDomain.BaseDirectory, "server", BackendExeName);
+
+    private string EndpointFilePath => Path.Combine(
+        Path.GetDirectoryName(BackendExePath)!, "Data", "endpoint.json");
 
     // ========== 生命周期 ==========
 
@@ -114,21 +129,50 @@ public partial class App : Application
         if (_isIntentionalExit)
             StopBackend();
 
-        if (_trayIcon != null)
-        {
-            _trayIcon.Visible = false;
-            _trayIcon.Dispose();
-        }
-
-        _iconGray?.Dispose();
-        _iconGreen?.Dispose();
-        _iconRed?.Dispose();
+        DisposeTrayResources();
 
         try { _mutex?.ReleaseMutex(); } catch { /* abandoned/owned */ }
         _mutex?.Dispose();
         _mutex = null;
 
         base.OnExit(e);
+    }
+
+    /// <summary>释放托盘图标、菜单、字体，避免 GDI/USER 句柄泄漏</summary>
+    private void DisposeTrayResources()
+    {
+        if (_trayIcon != null)
+        {
+            try
+            {
+                _trayIcon.Visible = false;
+                _trayIcon.ContextMenuStrip = null;
+                _trayIcon.Icon = null;
+                _trayIcon.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Dispose NotifyIcon failed: {ex.Message}");
+            }
+        }
+
+        try { _assignedTrayIcon?.Dispose(); } catch { /* ignore */ }
+        _assignedTrayIcon = null;
+
+        try { _contextMenu?.Dispose(); } catch { /* ignore */ }
+        _contextMenu = null;
+
+        try { _menuFont?.Dispose(); } catch { /* ignore */ }
+        try { _menuFontBold?.Dispose(); } catch { /* ignore */ }
+        _menuFont = null;
+        _menuFontBold = null;
+
+        try { _iconGray?.Dispose(); } catch { /* ignore */ }
+        try { _iconGreen?.Dispose(); } catch { /* ignore */ }
+        try { _iconRed?.Dispose(); } catch { /* ignore */ }
+        _iconGray = null;
+        _iconGreen = null;
+        _iconRed = null;
     }
 
     // ========== 托盘图标 & 右键菜单 ==========
@@ -139,12 +183,15 @@ public partial class App : Application
     /// </summary>
     private void CreateTrayIcon()
     {
-        var contextMenu = new ContextMenuStrip();
-        contextMenu.Renderer = new DarkMenuRenderer();
-        contextMenu.BackColor = ColorTranslator.FromHtml("#161b22");
-        contextMenu.ForeColor = ColorTranslator.FromHtml("#e6edf3");
-        contextMenu.Font = new Font("Segoe UI", 9f);
-        contextMenu.MinimumSize = new System.Drawing.Size(220, 0);
+        _menuFont = new Font("Segoe UI", 9f);
+        _menuFontBold = new Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+
+        _contextMenu = new ContextMenuStrip();
+        _contextMenu.Renderer = new DarkMenuRenderer();
+        _contextMenu.BackColor = ColorTranslator.FromHtml("#161b22");
+        _contextMenu.ForeColor = ColorTranslator.FromHtml("#e6edf3");
+        _contextMenu.Font = _menuFont;
+        _contextMenu.MinimumSize = new System.Drawing.Size(220, 0);
 
         // 状态指示（只读，不可点击）
         var statusItem = new ToolStripMenuItem("  检测中...")
@@ -156,7 +203,7 @@ public partial class App : Application
 
         // 管理面板（主入口，服务状态 / 文件管理）
         var adminItem = new ToolStripMenuItem("  管理面板");
-        adminItem.Font = new Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold);
+        adminItem.Font = _menuFontBold;
         adminItem.Click += (_, _) => OpenAdminPanel();
 
         // 打开日志查看器（日志浏览 / 关键字配置 / 搜索）
@@ -183,7 +230,7 @@ public partial class App : Application
         var exitItem = new ToolStripMenuItem("  退出");
         exitItem.Click += (_, _) => RequestIntentionalExit();
 
-        contextMenu.Items.AddRange(new ToolStripItem[]
+        _contextMenu.Items.AddRange(new ToolStripItem[]
         {
             adminItem,
             viewerItem,
@@ -204,11 +251,11 @@ public partial class App : Application
 
         _trayIcon = new NotifyIcon
         {
-            Icon = _iconGray,
-            ContextMenuStrip = contextMenu,
+            ContextMenuStrip = _contextMenu,
             Text = "LogViewer - 检测中...",
             Visible = true
         };
+        ApplyTrayIcon(_iconGray);
 
         // 双击托盘图标：打开管理控制台（"托盘 = 控制台" 语义）
         _trayIcon.DoubleClick += (_, _) => OpenAdminPanel();
@@ -255,7 +302,7 @@ public partial class App : Application
             _trayIcon.Text = $"LogViewer - 运行中 ({uptimeText})";
 
             if (_lastBackendRunning != true)
-                _trayIcon.Icon = _iconGreen;
+                ApplyTrayIcon(_iconGreen);
         }
         else
         {
@@ -264,10 +311,34 @@ public partial class App : Application
             _trayIcon.Text = "LogViewer - 未运行";
 
             if (_lastBackendRunning != false)
-                _trayIcon.Icon = _iconRed;
+                ApplyTrayIcon(_iconRed);
         }
 
         _lastBackendRunning = isRunning;
+    }
+
+    /// <summary>
+    /// 向 NotifyIcon 设置图标克隆，并释放上一次赋值的实例。
+    /// 模板图标（灰/绿/红）只创建一次，避免与 NotifyIcon 生命周期纠缠导致句柄泄漏或双释放。
+    /// </summary>
+    private void ApplyTrayIcon(Icon? template)
+    {
+        if (_trayIcon == null || template == null) return;
+
+        Icon? clone = null;
+        try
+        {
+            clone = (Icon)template.Clone();
+            var previous = _assignedTrayIcon;
+            _assignedTrayIcon = clone;
+            _trayIcon.Icon = clone;
+            previous?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            clone?.Dispose();
+            Debug.WriteLine($"ApplyTrayIcon failed: {ex.Message}");
+        }
     }
 
     /// <summary>通过进程名检测后端是否正在运行</summary>
@@ -353,6 +424,7 @@ public partial class App : Application
             _backendProcess.EnableRaisingEvents = true;
             _backendProcess.Exited += OnBackendExited;
             _startTime = DateTime.Now;
+            TrySyncServiceUrlFromEndpoint(existing.Id);
             return true;
         }
         catch (Exception ex)
@@ -379,6 +451,9 @@ public partial class App : Application
 
             DetachBackendProcess();
 
+            var port = FindAvailablePort(GetPreferredPort(), PortScanRange);
+            _serviceUrl = $"http://127.0.0.1:{port}";
+
             _backendProcess = new Process
             {
                 StartInfo = new ProcessStartInfo
@@ -393,8 +468,10 @@ public partial class App : Application
                 EnableRaisingEvents = true
             };
 
-            // 告知 Api 由托盘拉起：不要自行弹浏览器（避免崩溃重启反复弹窗）
+            // 告知 Api 由托盘拉起：不要自行弹浏览器；并绑定选定端口
             _backendProcess.StartInfo.Environment[LaunchedByTrayEnv] = "1";
+            _backendProcess.StartInfo.Environment["ASPNETCORE_URLS"] = _serviceUrl;
+            _backendProcess.StartInfo.Environment["LOGVIEWER_URL"] = _serviceUrl;
 
             _backendProcess.Exited += OnBackendExited;
             _backendProcess.Start();
@@ -428,6 +505,9 @@ public partial class App : Application
                 return;
             }
 
+            // Api 可能写入最终 endpoint（含实际监听地址）
+            TrySyncServiceUrlFromEndpoint(pid);
+
             if (await IsBackendHealthyAsync())
             {
                 _ = Dispatcher.BeginInvoke(() =>
@@ -449,17 +529,87 @@ public partial class App : Application
         {
             if (_isStopping) return;
             ShowNotification("LogViewer",
-                "后端进程已启动，但服务未在预期时间内就绪，请检查端口 5173 是否被占用。",
+                $"后端进程已启动，但服务未在预期时间内就绪（{_serviceUrl}）。请检查端口是否被占用。",
                 ToolTipIcon.Warning);
         });
     }
 
-    private static async Task<bool> IsBackendHealthyAsync()
+    private async Task<bool> IsBackendHealthyAsync()
     {
         try
         {
             using var response = await HealthClient.GetAsync(ServiceUrl);
             return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>从 Api 写入的 endpoint.json 同步实际服务地址</summary>
+    private void TrySyncServiceUrlFromEndpoint(int? expectedPid = null)
+    {
+        try
+        {
+            if (!File.Exists(EndpointFilePath)) return;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(EndpointFilePath));
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("url", out var urlProp)) return;
+
+            var url = urlProp.GetString();
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            if (expectedPid is int pid &&
+                root.TryGetProperty("pid", out var pidProp) &&
+                pidProp.TryGetInt32(out var filePid) &&
+                filePid != pid)
+            {
+                return;
+            }
+
+            _serviceUrl = url.Trim().TrimEnd('/');
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"TrySyncServiceUrlFromEndpoint failed: {ex.Message}");
+        }
+    }
+
+    private static int GetPreferredPort()
+    {
+        var env = Environment.GetEnvironmentVariable("LOGVIEWER_PORT");
+        if (int.TryParse(env, out var port) && port is > 0 and < 65536)
+            return port;
+        return DefaultPort;
+    }
+
+    /// <summary>从 preferred 起扫描可用 TCP 端口</summary>
+    private static int FindAvailablePort(int preferred, int range)
+    {
+        for (var port = preferred; port < preferred + range && port <= 65535; port++)
+        {
+            if (IsPortAvailable(port))
+                return port;
+        }
+
+        // 回退：让系统分配临时端口号再立刻释放，仅作最后手段
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var ephemeral = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return ephemeral;
+    }
+
+    private static bool IsPortAvailable(int port)
+    {
+        try
+        {
+            var listener = new TcpListener(IPAddress.Loopback, port);
+            listener.Start();
+            listener.Stop();
+            return true;
         }
         catch
         {
@@ -625,10 +775,10 @@ public partial class App : Application
     }
 
     /// <summary>打开管理控制台（服务状态 / 已上传文件管理）</summary>
-    private static void OpenAdminPanel() => OpenUrl(AdminUrl);
+    private void OpenAdminPanel() => OpenUrl(AdminUrl);
 
     /// <summary>打开日志查看器主界面</summary>
-    private static void OpenLogViewer() => OpenUrl(ServiceUrl);
+    private void OpenLogViewer() => OpenUrl(ServiceUrl);
 
     // ========== 开机自启动（注册表） ==========
 

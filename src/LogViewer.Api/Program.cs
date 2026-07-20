@@ -1,4 +1,7 @@
-﻿using LogViewer.Api.Endpoints;
+﻿using System.Net;
+using System.Net.Sockets;
+using System.Text.Json;
+using LogViewer.Api.Endpoints;
 using LogViewer.Api.Services;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -52,9 +55,14 @@ app.MapDashboardEndpoints();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-// ========== 监听地址 & 自动打开浏览器 ==========
-var url = "http://localhost:5173";
+// ========== 监听地址 ==========
+// 优先级：ASPNETCORE_URLS / LOGVIEWER_URL（托盘传入）> appsettings LogViewer:Port > 默认 5173（占用则自动顺延）
+var url = ResolveListenUrl(builder.Configuration);
+app.Urls.Clear();
 app.Urls.Add(url);
+
+WriteEndpointFile(app.Environment, url);
+app.Lifetime.ApplicationStopping.Register(() => ClearEndpointFile(app.Environment));
 
 // 由托盘启动器拉起时不自动弹浏览器（避免崩溃重启反复开页）；直接运行 Api.exe 时仍自动打开
 var launchedByTray = string.Equals(
@@ -86,6 +94,88 @@ if (!launchedByTray)
 }
 
 app.Run();
+
+// ========== URL / 端口解析 ==========
+static string ResolveListenUrl(IConfiguration config)
+{
+    var fromEnv = Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
+        ?? Environment.GetEnvironmentVariable("LOGVIEWER_URL");
+    if (!string.IsNullOrWhiteSpace(fromEnv))
+        return fromEnv.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)[0];
+
+    var host = config.GetValue("LogViewer:Host", "127.0.0.1") ?? "127.0.0.1";
+    var preferred = config.GetValue("LogViewer:Port", 5173);
+    if (preferred is <= 0 or >= 65536)
+        preferred = 5173;
+
+    var port = FindAvailablePort(preferred, 100);
+    return $"http://{host}:{port}";
+}
+
+static int FindAvailablePort(int preferred, int range)
+{
+    for (var port = preferred; port < preferred + range && port <= 65535; port++)
+    {
+        if (IsPortAvailable(port))
+            return port;
+    }
+
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var ephemeral = ((IPEndPoint)listener.LocalEndpoint).Port;
+    listener.Stop();
+    return ephemeral;
+}
+
+static bool IsPortAvailable(int port)
+{
+    try
+    {
+        var listener = new TcpListener(IPAddress.Loopback, port);
+        listener.Start();
+        listener.Stop();
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static void WriteEndpointFile(IHostEnvironment env, string url)
+{
+    try
+    {
+        var dir = Path.Combine(env.ContentRootPath, "Data");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "endpoint.json");
+        var json = JsonSerializer.Serialize(new
+        {
+            url,
+            pid = Environment.ProcessId,
+            writtenAt = DateTime.UtcNow
+        });
+        File.WriteAllText(path, json);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"WriteEndpointFile failed: {ex.Message}");
+    }
+}
+
+static void ClearEndpointFile(IHostEnvironment env)
+{
+    try
+    {
+        var path = Path.Combine(env.ContentRootPath, "Data", "endpoint.json");
+        if (File.Exists(path))
+            File.Delete(path);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"ClearEndpointFile failed: {ex.Message}");
+    }
+}
 
 // ========== 孤立上传文件清理（基于 SQLite 历史记录） ==========
 static void CleanupOrphanedUploads(WebApplication app)
