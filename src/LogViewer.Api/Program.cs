@@ -56,43 +56,68 @@ app.UseStaticFiles();
 var url = "http://localhost:5173";
 app.Urls.Add(url);
 
-app.Lifetime.ApplicationStarted.Register(() =>
+// 由托盘启动器拉起时不自动弹浏览器（避免崩溃重启反复开页）；直接运行 Api.exe 时仍自动打开
+var launchedByTray = string.Equals(
+    Environment.GetEnvironmentVariable("LOGVIEWER_LAUNCHED_BY_TRAY"),
+    "1",
+    StringComparison.Ordinal);
+
+if (!launchedByTray)
 {
-    _ = Task.Run(async () =>
+    app.Lifetime.ApplicationStarted.Register(() =>
     {
-        await Task.Delay(500);
-        try
+        _ = Task.Run(async () =>
         {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            await Task.Delay(500);
+            try
             {
-                FileName = url,
-                UseShellExecute = true
-            });
-        }
-        catch { }
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Open browser failed: {ex.Message}");
+            }
+        });
     });
-});
+}
 
 app.Run();
 
 // ========== 孤立上传文件清理（基于 SQLite 历史记录） ==========
 static void CleanupOrphanedUploads(WebApplication app)
 {
-    var historyService = app.Services.GetRequiredService<HistoryService>();
-    var uploadsDir = Path.Combine(app.Environment.ContentRootPath, "Data", "uploads");
-    if (!Directory.Exists(uploadsDir)) return;
-
-    var allRecords = historyService.GetAll();
-    var referencedPaths = new HashSet<string>(
-        allRecords.Where(r => r.Source == "upload").Select(r => r.FilePath),
-        StringComparer.OrdinalIgnoreCase);
-
-    foreach (var file in Directory.GetFiles(uploadsDir))
+    try
     {
-        if (!referencedPaths.Contains(file))
-            try { File.Delete(file); } catch { }
-    }
+        var historyService = app.Services.GetRequiredService<HistoryService>();
+        var uploadsDir = Path.Combine(app.Environment.ContentRootPath, "Data", "uploads");
+        if (!Directory.Exists(uploadsDir)) return;
 
-    if (!Directory.EnumerateFiles(uploadsDir).Any())
-        try { Directory.Delete(uploadsDir); } catch { }
+        var allRecords = historyService.GetAll();
+        var referencedPaths = new HashSet<string>(
+            allRecords.Where(r => r.Source == "upload").Select(r => r.FilePath),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in Directory.GetFiles(uploadsDir))
+        {
+            if (!referencedPaths.Contains(file))
+            {
+                try { File.Delete(file); }
+                catch (Exception ex) { Console.Error.WriteLine($"Delete orphan upload failed: {file} — {ex.Message}"); }
+            }
+        }
+
+        if (!Directory.EnumerateFiles(uploadsDir).Any())
+        {
+            try { Directory.Delete(uploadsDir); }
+            catch (Exception ex) { Console.Error.WriteLine($"Delete empty uploads dir failed: {ex.Message}"); }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"CleanupOrphanedUploads failed: {ex.Message}");
+    }
 }
