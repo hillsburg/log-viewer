@@ -1,0 +1,193 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LogViewer</title>
+    <!--
+        字体策略：
+        - Outfit        : UI 排版（标题、按钮、标签），现代几何风格，替代系统字体
+        - JetBrains Mono: 日志内容显示，等宽字体，连字支持，辨识度高
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="app">
+
+        <!-- ========== 顶部工具栏 ========== -->
+        <header class="toolbar">
+            <div class="toolbar-left">
+                <button id="btn-open" class="btn btn-primary" data-i18n="toolbar.openFile">打开文件</button>
+                <input type="file" id="file-input" accept=".log,.txt" style="display:none">
+                <span id="file-name" class="file-name"></span>
+            </div>
+            <div class="toolbar-right">
+                <span id="file-info" class="file-info"></span>
+                <button id="btn-toggle-history" class="btn btn-sm" title="切换历史记录" data-i18n="toolbar.history" data-i18n-title="toolbar.history">历史记录</button>
+                <button id="btn-lang-toggle" class="btn btn-sm" title="切换语言">EN</button>
+                <button id="btn-theme-toggle" class="theme-toggle" title="切换主题" data-i18n-title="toolbar.themeDark">☀</button>
+            </div>
+        </header>
+
+        <div class="main">
+
+            <!-- ========== 左侧侧边栏：关键字 + 搜索 ========== -->
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-header">
+                    <h3 data-i18n="sidebar.keywordsTitle">关键字配置</h3>
+                    <button id="btn-toggle-sidebar" class="btn-icon" title="折叠">&laquo;</button>
+                </div>
+
+                <!-- 关键字配置区 -->
+                <div class="sidebar-section">
+                    <div class="section-header">
+                        <span data-i18n="sidebar.keywords">关键字</span>
+                        <div class="keyword-header-actions">
+                            <button id="btn-export-keywords" class="btn-text" title="导出关键字配置" data-i18n="sidebar.export">导出</button>
+                            <button id="btn-import-keywords" class="btn-text" title="导入关键字配置" data-i18n="sidebar.import">导入</button>
+                        </div>
+                    </div>
+                    <div id="keyword-list" class="keyword-list"></div>
+                    <div class="keyword-add">
+                        <input type="text" id="new-keyword-text" placeholder="关键字" class="input-sm" data-i18n-placeholder="sidebar.keywordPlaceholder">
+                        <input type="color" id="new-keyword-color" value="#ff4444" class="color-picker">
+                        <button id="btn-add-keyword" class="btn btn-sm btn-primary">+</button>
+                    </div>
+                    <input type="file" id="keyword-file-input" accept=".json" style="display:none">
+                </div>
+
+                <!-- 搜索区 -->
+                <div class="sidebar-section">
+                    <div class="section-header"><span data-i18n="sidebar.search">搜索</span></div>
+                    <div class="search-box">
+                        <input type="text" id="search-input" placeholder="搜索关键字..." class="input-sm" data-i18n-placeholder="sidebar.searchPlaceholder">
+                        <button id="btn-search" class="btn btn-sm" data-i18n="sidebar.search">搜索</button>
+                    </div>
+                    <div id="search-result" class="search-result"></div>
+                    <div class="search-nav" id="search-nav" style="display:none">
+                        <button id="btn-prev" class="btn btn-sm" data-i18n="sidebar.prev">&uarr; 上一个</button>
+                        <span id="search-index">0/0</span>
+                        <button id="btn-next" class="btn btn-sm" data-i18n="sidebar.next">下一个 &darr;</button>
+                        <button id="btn-clear-search" class="btn btn-sm btn-text" data-i18n="sidebar.clearSearch" title="清除搜索高亮">&times;</button>
+                    </div>
+                </div>
+            </aside>
+
+            <div class="sidebar-collapsed" id="sidebar-collapsed" style="display:none">
+                <button id="btn-expand-sidebar" class="btn-icon" title="展开">&raquo;</button>
+            </div>
+
+            <!-- ========== 日志展示主区域 ========== -->
+            <main class="content">
+                <div class="log-viewer" id="log-viewer">
+
+                    <div class="drop-overlay" id="drop-overlay">
+                        <div class="drop-overlay-content">
+                            <span class="drop-icon">📄</span>
+                            <p data-i18n="editor.dropFile">释放文件以打开</p>
+                        </div>
+                    </div>
+
+                    <div class="log-placeholder" id="log-placeholder">
+                        <p data-i18n="editor.openPrompt">请打开一个 .log 或 .txt 文件</p>
+                        <p class="hint" data-i18n="editor.openHint">支持拖拽文件到此处 · 支持从历史记录中选择</p>
+                    </div>
+
+                    <div class="log-scroll-container" id="log-scroll" style="display:none">
+                        <div class="log-scroll-spacer" id="log-spacer"></div>
+                        <div class="log-lines" id="log-lines"></div>
+                    </div>
+                </div>
+            </main>
+
+            <!-- ========== 右侧历史记录面板（可收起） ========== -->
+            <aside class="history-panel" id="history-panel">
+                <div class="history-panel-header">
+                    <span data-i18n="history.title">历史记录</span>
+                    <div class="history-panel-actions">
+                        <button id="btn-clear-history" class="btn-text" title="清空历史" data-i18n="history.clear">清空</button>
+                        <button id="btn-close-history" class="btn-icon" title="关闭">&times;</button>
+                    </div>
+                </div>
+
+                <div class="history-search-wrap">
+                    <input type="text" id="history-search" placeholder="过滤文件名..." class="input-sm" data-i18n-placeholder="history.filterPlaceholder">
+                </div>
+
+                <div class="history-tabs">
+                    <button class="history-tab active" data-sort="recent" data-i18n="history.recent">最近打开</button>
+                    <button class="history-tab" data-sort="frequent" data-i18n="history.frequent">最常用</button>
+                </div>
+
+                <div class="history-list-wrap">
+                    <div id="history-list" class="history-list"></div>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <!-- Toast 容器：消息队列，连续通知依次堆叠 -->
+    <div id="toast-wrap"></div>
+
+    <!-- 导入对话框 -->
+    <div class="modal-backdrop" id="import-modal">
+        <div class="modal">
+            <h3>导入关键字配置</h3>
+            <div id="import-file-info" class="import-file-info"></div>
+            <div class="import-options">
+                <label class="import-option">
+                    <input type="radio" name="import-mode" value="replace" checked>
+                    <span>替换模式</span>
+                    <span class="import-option-desc">导入全部，与现有同名关键字冲突时覆盖，不冲突的保留</span>
+                </label>
+                <label class="import-option">
+                    <input type="radio" name="import-mode" value="merge">
+                    <span>合并模式</span>
+                    <span class="import-option-desc">保留现有关键字，新增不冲突的</span>
+                </label>
+            </div>
+            <div id="import-conflict-options" class="import-conflict-options" style="display:none">
+                <span class="import-conflict-label">同名关键字冲突时：</span>
+                <label class="import-option-small">
+                    <input type="radio" name="import-conflict" value="skip" checked> 跳过（保留现有）
+                </label>
+                <label class="import-option-small">
+                    <input type="radio" name="import-conflict" value="overwrite"> 覆盖（用导入的替换）
+                </label>
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closeImportModal()">取消</button>
+                <button class="btn primary" id="btn-confirm-import" onclick="confirmImport()">导入</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay">
+        <div class="loading-card">
+            <div class="loading-spinner"></div>
+            <div id="loading-text" class="loading-text">加载中...</div>
+            <div id="loading-progress-wrap" class="loading-progress-wrap" style="display:none">
+                <div id="loading-progress-bar" class="loading-progress-bar"></div>
+                <div id="loading-progress-pct" class="loading-progress-pct">0%</div>
+            </div>
+        </div>
+    </div>
+
+    <!--
+        脚本加载顺序（后加载的依赖先加载的）：
+        1. highlight.js      - 高亮引擎，被 VirtualScroll 调用
+        2. virtual-scroll.js - 虚拟滚动，被 App 调用
+        3. keyword-panel.js  - 关键字面板 UI，被 App 调用
+        4. app.js            - 应用主控，最后加载并触发初始化
+    -->
+    <script src="js/i18n.js"></script>
+    <script src="js/highlight.js"></script>
+    <script src="js/virtual-scroll.js"></script>
+    <script src="js/keyword-panel.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

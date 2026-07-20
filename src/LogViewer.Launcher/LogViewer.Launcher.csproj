@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>LogViewer</AssemblyName>
+    <RootNamespace>LogViewer.Launcher</RootNamespace>
+
+    <!-- Launcher 输出到 publish/ 根目录，Api 输出到 publish/server/ 子目录 -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>..\..\publish</OutputPath>
+  </PropertyGroup>
+
+</Project>
