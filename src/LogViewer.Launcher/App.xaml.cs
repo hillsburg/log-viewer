@@ -3,7 +3,8 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
-using System.Reflection;
+using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -13,6 +14,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Application = System.Windows.Application;
 using MediaColor = System.Windows.Media.Color;
+using Microsoft.Win32;
 
 namespace LogViewer.Launcher;
 
@@ -20,11 +22,12 @@ namespace LogViewer.Launcher;
 /// LogViewer 系统托盘启动器。
 ///
 /// 职责：
-/// - 启动时自动拉起 LogViewer.Api.exe 后端进程（隐藏窗口）
+/// - 启动时自动拉起 LogViewer.Api.exe 后端进程（隐藏窗口）；若已在运行则直接附着
 /// - 每 2 秒轮询检测后端进程是否存活（Process.GetProcessesByName）
 /// - 托盘图标颜色随状态变化：灰色=检测中，绿色=运行中，红色=未运行
 /// - 右键菜单：打开浏览器、状态显示、重启/停止服务、开机自启动、退出
 /// - 后端异常退出时自动重启（最多 3 次，间隔递增）
+/// - 托盘自身异常退出时由 watchdog + RegisterApplicationRestart 自动拉起（手动退出除外）
 /// - 开机自启动通过注册表 HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run 实现
 ///
 /// 设计风格：Terminal Professional（与 LogViewer 主界面统一）
@@ -41,11 +44,26 @@ public partial class App : Application
     private const int MaxRestartAttempts = 3;
     private DateTime _startTime;
     private volatile bool _isStopping;
+    private volatile bool _isIntentionalExit;
+    private bool? _lastBackendRunning;
+    private Icon? _iconGray;
+    private Icon? _iconGreen;
+    private Icon? _iconRed;
+    private bool _hasOpenedBrowserOnStart;
+    private static readonly HttpClient HealthClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(2)
+    };
 
     // ========== 配置常量 ==========
     private static readonly string BackendExeName = "LogViewer.Api.exe";
+    private static readonly string BackendProcessName = "LogViewer.Api";
     private static readonly string ServiceUrl = "http://localhost:5173";
     private static readonly string AdminUrl = "http://localhost:5173/admin.html";
+    private const string WatchdogArg = "--watchdog";
+    private const string LaunchedByTrayEnv = "LOGVIEWER_LAUNCHED_BY_TRAY";
+    private static readonly string CleanExitMarkerPath = Path.Combine(
+        Path.GetTempPath(), "LogViewer.Launcher.clean-exit");
 
     /// <summary>后端 exe 路径：启动器所在目录的 server/ 子目录</summary>
     private string BackendExePath => Path.Combine(
@@ -57,6 +75,16 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // Watchdog 模式：监视托盘进程，非干净退出时重新拉起
+        if (e.Args.Length >= 2 &&
+            string.Equals(e.Args[0], WatchdogArg, StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(e.Args[1], out int parentPid))
+        {
+            RunWatchdog(parentPid);
+            Shutdown();
+            return;
+        }
+
         // 单实例保护：防止同时运行多个托盘启动器
         _mutex = new Mutex(true, "LogViewer.Launcher.SingleInstance", out bool isNew);
         if (!isNew)
@@ -67,6 +95,11 @@ public partial class App : Application
         }
 
         base.OnStartup(e);
+        InstallExceptionHandlers();
+        SystemEvents.SessionEnding += OnSessionEnding;
+        TryDeleteCleanExitMarker();
+        RegisterForCrashRestart();
+        StartWatchdog();
         CreateTrayIcon();
         StartBackend();
         StartStatusMonitor();
@@ -74,8 +107,27 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
-        StopBackend();
-        _trayIcon?.Dispose();
+        try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { /* ignore */ }
+        _statusTimer?.Stop();
+
+        // 仅手动退出 / 注销会话时停止后端；异常退出保留 Api，便于托盘重启后附着
+        if (_isIntentionalExit)
+            StopBackend();
+
+        if (_trayIcon != null)
+        {
+            _trayIcon.Visible = false;
+            _trayIcon.Dispose();
+        }
+
+        _iconGray?.Dispose();
+        _iconGreen?.Dispose();
+        _iconRed?.Dispose();
+
+        try { _mutex?.ReleaseMutex(); } catch { /* abandoned/owned */ }
+        _mutex?.Dispose();
+        _mutex = null;
+
         base.OnExit(e);
     }
 
@@ -127,13 +179,9 @@ public partial class App : Application
         };
         autoStartItem.Click += (_, _) => SetAutoStart(autoStartItem.Checked);
 
-        // 退出（标记 _isStopping 阻止自动重启逻辑）
+        // 退出（干净退出：写标记 + 注销崩溃重启，watchdog 不会再拉起）
         var exitItem = new ToolStripMenuItem("  退出");
-        exitItem.Click += (_, _) =>
-        {
-            _isStopping = true;
-            Shutdown();
-        };
+        exitItem.Click += (_, _) => RequestIntentionalExit();
 
         contextMenu.Items.AddRange(new ToolStripItem[]
         {
@@ -150,9 +198,13 @@ public partial class App : Application
             exitItem
         });
 
+        _iconGray = CreateIcon(MediaColor.FromRgb(0x8b, 0x94, 0x9e));
+        _iconGreen = CreateIcon(MediaColor.FromRgb(0x3f, 0xb9, 0x50));
+        _iconRed = CreateIcon(MediaColor.FromRgb(0xf8, 0x51, 0x49));
+
         _trayIcon = new NotifyIcon
         {
-            Icon = CreateIcon(MediaColor.FromRgb(0x8b, 0x94, 0x9e)),
+            Icon = _iconGray,
             ContextMenuStrip = contextMenu,
             Text = "LogViewer - 检测中...",
             Visible = true
@@ -180,6 +232,7 @@ public partial class App : Application
     /// 检测后端进程存活状态，更新托盘图标颜色和菜单文字。
     /// 运行中 → 绿色图标 + 运行时长
     /// 未运行 → 红色图标
+    /// 图标使用缓存实例，避免每 2 秒新建导致 GDI 句柄耗尽后托盘崩溃退出。
     /// </summary>
     private void UpdateStatus()
     {
@@ -199,16 +252,22 @@ public partial class App : Application
 
             statusItem.Text = $"  运行中    {uptimeText}";
             statusItem.ForeColor = ColorTranslator.FromHtml("#3fb950");
-            _trayIcon.Icon = CreateIcon(MediaColor.FromRgb(0x3f, 0xb9, 0x50));
             _trayIcon.Text = $"LogViewer - 运行中 ({uptimeText})";
+
+            if (_lastBackendRunning != true)
+                _trayIcon.Icon = _iconGreen;
         }
         else
         {
             statusItem.Text = "  未运行";
             statusItem.ForeColor = ColorTranslator.FromHtml("#f85149");
-            _trayIcon.Icon = CreateIcon(MediaColor.FromRgb(0xf8, 0x51, 0x49));
             _trayIcon.Text = "LogViewer - 未运行";
+
+            if (_lastBackendRunning != false)
+                _trayIcon.Icon = _iconRed;
         }
+
+        _lastBackendRunning = isRunning;
     }
 
     /// <summary>通过进程名检测后端是否正在运行</summary>
@@ -216,18 +275,27 @@ public partial class App : Application
     {
         try
         {
-            var processes = Process.GetProcessesByName("LogViewer.Api");
-            return processes.Length > 0;
+            var processes = Process.GetProcessesByName(BackendProcessName);
+            try
+            {
+                return processes.Length > 0;
+            }
+            finally
+            {
+                foreach (var p in processes)
+                    p.Dispose();
+            }
         }
-        catch
+        catch (Exception ex)
         {
+            Debug.WriteLine($"IsBackendRunning failed: {ex.Message}");
             return false;
         }
     }
 
     // ========== 后端进程管理 ==========
 
-    /// <summary>首次启动后端，重置崩溃计数器</summary>
+    /// <summary>首次启动后端：已有实例则附着，否则拉起新进程</summary>
     private void StartBackend()
     {
         if (!File.Exists(BackendExePath))
@@ -238,21 +306,78 @@ public partial class App : Application
 
         _isStopping = false;
         _crashRestartCount = 0;
-        LaunchBackendProcess();
+
+        if (TryAttachToExistingBackend())
+            return;
+
+        LaunchBackendProcess(openBrowserOnReady: true);
+    }
+
+    /// <summary>
+    /// 附着到已在运行的 LogViewer.Api（托盘重启场景）。
+    /// 若存在多个实例，保留第一个并终止其余，避免端口/状态混乱。
+    /// </summary>
+    private bool TryAttachToExistingBackend()
+    {
+        try
+        {
+            var processes = Process.GetProcessesByName(BackendProcessName);
+            Process? existing = null;
+            foreach (var p in processes)
+            {
+                if (existing == null && !p.HasExited)
+                {
+                    existing = p;
+                    continue;
+                }
+
+                try
+                {
+                    if (!p.HasExited)
+                    {
+                        try { p.Kill(entireProcessTree: true); }
+                        catch (Exception ex) { Debug.WriteLine($"Kill extra Api failed: {ex.Message}"); }
+                    }
+                }
+                finally
+                {
+                    p.Dispose();
+                }
+            }
+
+            if (existing == null)
+                return false;
+
+            DetachBackendProcess();
+            _backendProcess = existing;
+            _backendProcess.EnableRaisingEvents = true;
+            _backendProcess.Exited += OnBackendExited;
+            _startTime = DateTime.Now;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"TryAttachToExistingBackend failed: {ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>
     /// 启动 LogViewer.Api.exe 子进程。
-    /// 先释放旧进程对象（如有），避免句柄泄漏。
     /// CreateNoWindow = true 隐藏控制台窗口，
     /// EnableRaisingEvents = true 以便监听 Exited 事件。
     /// </summary>
-    private void LaunchBackendProcess()
+    private void LaunchBackendProcess(bool openBrowserOnReady = false)
     {
+        if (_isStopping) return;
+
         try
         {
-            _backendProcess?.Dispose();
-            _backendProcess = null;
+            // 启动前若已有 Api（例如附着失败后的竞态），改为附着而非再起一个
+            if (TryAttachToExistingBackend())
+                return;
+
+            DetachBackendProcess();
 
             _backendProcess = new Process
             {
@@ -268,14 +393,86 @@ public partial class App : Application
                 EnableRaisingEvents = true
             };
 
+            // 告知 Api 由托盘拉起：不要自行弹浏览器（避免崩溃重启反复弹窗）
+            _backendProcess.StartInfo.Environment[LaunchedByTrayEnv] = "1";
+
             _backendProcess.Exited += OnBackendExited;
             _backendProcess.Start();
             _startTime = DateTime.Now;
+
+            var pid = _backendProcess.Id;
+            _ = Task.Run(() => WaitForBackendHealthyAsync(pid, openBrowserOnReady));
         }
         catch (Exception ex)
         {
+            Debug.WriteLine($"LaunchBackendProcess failed: {ex}");
             ShowNotification("LogViewer 启动失败", ex.Message, ToolTipIcon.Error);
         }
+    }
+
+    /// <summary>轮询 HTTP，确认后端真正可服务后再通知 / 打开浏览器</summary>
+    private async Task WaitForBackendHealthyAsync(int pid, bool openBrowserOnReady)
+    {
+        const int maxAttempts = 20;
+        for (var i = 0; i < maxAttempts; i++)
+        {
+            if (_isStopping) return;
+
+            try
+            {
+                if (_backendProcess == null || _backendProcess.HasExited || _backendProcess.Id != pid)
+                    return;
+            }
+            catch
+            {
+                return;
+            }
+
+            if (await IsBackendHealthyAsync())
+            {
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    if (_isStopping) return;
+                    if (openBrowserOnReady && !_hasOpenedBrowserOnStart)
+                    {
+                        _hasOpenedBrowserOnStart = true;
+                        OpenLogViewer();
+                    }
+                });
+                return;
+            }
+
+            await Task.Delay(500);
+        }
+
+        _ = Dispatcher.BeginInvoke(() =>
+        {
+            if (_isStopping) return;
+            ShowNotification("LogViewer",
+                "后端进程已启动，但服务未在预期时间内就绪，请检查端口 5173 是否被占用。",
+                ToolTipIcon.Warning);
+        });
+    }
+
+    private static async Task<bool> IsBackendHealthyAsync()
+    {
+        try
+        {
+            using var response = await HealthClient.GetAsync(ServiceUrl);
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void DetachBackendProcess()
+    {
+        if (_backendProcess == null) return;
+        try { _backendProcess.Exited -= OnBackendExited; } catch { /* ignore */ }
+        try { _backendProcess.Dispose(); } catch (Exception ex) { Debug.WriteLine($"Detach dispose: {ex.Message}"); }
+        _backendProcess = null;
     }
 
     /// <summary>
@@ -292,10 +489,11 @@ public partial class App : Application
 
         if (_crashRestartCount <= MaxRestartAttempts)
         {
+            var attempt = _crashRestartCount;
             Dispatcher.BeginInvoke(() =>
             {
                 ShowNotification("LogViewer",
-                    $"后端进程异常退出，正在第 {_crashRestartCount}/{MaxRestartAttempts} 次重启...",
+                    $"后端进程异常退出，正在第 {attempt}/{MaxRestartAttempts} 次重启...",
                     ToolTipIcon.Warning);
             });
 
@@ -303,10 +501,17 @@ public partial class App : Application
             {
                 try
                 {
-                    await Task.Delay(1000 * _crashRestartCount);
-                    _ = Dispatcher.BeginInvoke(LaunchBackendProcess);
+                    await Task.Delay(1000 * attempt);
+                    _ = Dispatcher.BeginInvoke(() =>
+                    {
+                        if (_isStopping) return;
+                        LaunchBackendProcess(openBrowserOnReady: false);
+                    });
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Backend restart schedule failed: {ex.Message}");
+                }
             });
         }
         else
@@ -320,32 +525,86 @@ public partial class App : Application
         }
     }
 
-    /// <summary>停止后端进程（Kill 整个进程树，等待最多 3 秒）</summary>
+    /// <summary>
+    /// 停止后端：先杀跟踪句柄，再按进程名清场所有 LogViewer.Api，
+    /// 避免孤儿进程在「退出/停止」后仍占用端口。
+    /// </summary>
     private void StopBackend()
     {
         _isStopping = true;
 
-        if (_backendProcess != null && !_backendProcess.HasExited)
+        if (_backendProcess != null)
         {
             try
             {
-                _backendProcess.Kill(entireProcessTree: true);
-                _backendProcess.WaitForExit(3000);
+                if (!_backendProcess.HasExited)
+                {
+                    _backendProcess.Kill(entireProcessTree: true);
+                    if (!_backendProcess.WaitForExit(3000))
+                        Debug.WriteLine("Tracked backend did not exit within 3s after Kill.");
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"StopBackend tracked kill failed: {ex.Message}");
+            }
         }
 
-        _backendProcess?.Dispose();
-        _backendProcess = null;
+        KillAllBackendProcesses();
+        DetachBackendProcess();
     }
 
-    /// <summary>重启服务：停止 → 重置计数器 → 重新启动</summary>
+    /// <summary>终止所有 LogViewer.Api 进程（含孤儿实例）</summary>
+    private static void KillAllBackendProcesses()
+    {
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName(BackendProcessName);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"GetProcessesByName failed: {ex.Message}");
+            return;
+        }
+
+        foreach (var p in processes)
+        {
+            try
+            {
+                if (!p.HasExited)
+                {
+                    p.Kill(entireProcessTree: true);
+                    if (!p.WaitForExit(3000))
+                        Debug.WriteLine($"Api pid={p.Id} did not exit within 3s.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Kill Api pid={p.Id} failed: {ex.Message}");
+            }
+            finally
+            {
+                p.Dispose();
+            }
+        }
+    }
+
+    /// <summary>重启服务：停止全部实例 → 重置计数器 → 重新启动</summary>
     private void RestartBackend()
     {
         StopBackend();
-        _isStopping = false;
-        _crashRestartCount = 0;
-        LaunchBackendProcess();
+        // 给已排队的自动重启回调一点时间看到 _isStopping，避免竞态再拉起
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(200);
+            _ = Dispatcher.BeginInvoke(() =>
+            {
+                _isStopping = false;
+                _crashRestartCount = 0;
+                LaunchBackendProcess(openBrowserOnReady: false);
+            });
+        });
     }
 
     /// <summary>用系统默认浏览器打开指定 URL</summary>
@@ -359,7 +618,10 @@ public partial class App : Application
                 UseShellExecute = true
             });
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"OpenUrl failed: {ex.Message}");
+        }
     }
 
     /// <summary>打开管理控制台（服务状态 / 已上传文件管理）</summary>
@@ -396,7 +658,9 @@ public partial class App : Application
 
             if (enable)
             {
-                var exePath = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                var exePath = Environment.ProcessPath
+                    ?? Process.GetCurrentProcess().MainModule?.FileName
+                    ?? "";
                 key.SetValue("LogViewer", $"\"{exePath}\"");
             }
             else
@@ -404,7 +668,10 @@ public partial class App : Application
                 key.DeleteValue("LogViewer", false);
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"SetAutoStart failed: {ex.Message}");
+        }
     }
 
     // ========== 动态托盘图标生成 ==========
@@ -472,8 +739,15 @@ public partial class App : Application
 
         using var bitmap = new System.Drawing.Bitmap(ms);
         var hIcon = bitmap.GetHicon();
-        var icon = System.Drawing.Icon.FromHandle(hIcon);
-        return (System.Drawing.Icon)icon.Clone();
+        try
+        {
+            using var icon = System.Drawing.Icon.FromHandle(hIcon);
+            return (System.Drawing.Icon)icon.Clone();
+        }
+        finally
+        {
+            DestroyIcon(hIcon);
+        }
     }
 
     /// <summary>
@@ -488,6 +762,161 @@ public partial class App : Application
         }
         catch { }
     }
+
+    // ========== 托盘保活：异常拦截 / 崩溃重启 / Watchdog ==========
+
+    private void RequestIntentionalExit()
+    {
+        _isIntentionalExit = true;
+        _isStopping = true;
+        try { File.WriteAllText(CleanExitMarkerPath, DateTime.UtcNow.Ticks.ToString()); }
+        catch (Exception ex) { Debug.WriteLine($"Write clean-exit marker failed: {ex.Message}"); }
+        UnregisterApplicationRestart();
+        Shutdown();
+    }
+
+    /// <summary>注销/关机时视为干净退出，避免 watchdog 在空会话里再拉起托盘</summary>
+    private void OnSessionEnding(object sender, SessionEndingEventArgs e)
+    {
+        if (_isIntentionalExit) return;
+        _isIntentionalExit = true;
+        _isStopping = true;
+        try { File.WriteAllText(CleanExitMarkerPath, DateTime.UtcNow.Ticks.ToString()); }
+        catch (Exception ex) { Debug.WriteLine($"SessionEnding marker failed: {ex.Message}"); }
+        UnregisterApplicationRestart();
+        StopBackend();
+    }
+
+    private void InstallExceptionHandlers()
+    {
+        DispatcherUnhandledException += (_, args) =>
+        {
+            args.Handled = true;
+            try
+            {
+                ShowNotification("LogViewer", $"发生错误但已继续运行：{args.Exception.Message}", ToolTipIcon.Warning);
+            }
+            catch { }
+        };
+
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            // 无法阻止终结时的退出；依赖 watchdog / RegisterApplicationRestart 拉起
+            try
+            {
+                var ex = args.ExceptionObject as Exception;
+                Debug.WriteLine($"UnhandledException: {ex}");
+            }
+            catch { }
+        };
+
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            args.SetObserved();
+        };
+    }
+
+    private static void TryDeleteCleanExitMarker()
+    {
+        try
+        {
+            if (File.Exists(CleanExitMarkerPath))
+                File.Delete(CleanExitMarkerPath);
+        }
+        catch { }
+    }
+
+    private static void RegisterForCrashRestart()
+    {
+        try
+        {
+            // flags=0：崩溃/无响应时由 WER 重启；手动退出前会 Unregister
+            RegisterApplicationRestart(null, 0);
+        }
+        catch { }
+    }
+
+    private static void StartWatchdog()
+    {
+        try
+        {
+            var exePath = Environment.ProcessPath
+                ?? Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrEmpty(exePath)) return;
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = exePath,
+                Arguments = $"{WatchdogArg} {Environment.ProcessId}",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// 监视托盘主进程。主进程退出后：
+    /// - 若存在干净退出标记 → 不重启（用户点了「退出」）
+    /// - 若单实例 Mutex 已被占用 → 说明 WER/其它路径已拉起，跳过
+    /// - 否则重新启动托盘
+    /// </summary>
+    private static void RunWatchdog(int parentPid)
+    {
+        try
+        {
+            using var parent = Process.GetProcessById(parentPid);
+            parent.WaitForExit();
+        }
+        catch
+        {
+            // 父进程已不存在
+        }
+
+        Thread.Sleep(800);
+
+        if (File.Exists(CleanExitMarkerPath))
+        {
+            TryDeleteCleanExitMarker();
+            return;
+        }
+
+        // 避免与 RegisterApplicationRestart 双拉起
+        try
+        {
+            using var probe = new Mutex(false, "LogViewer.Launcher.SingleInstance", out bool createdNew);
+            if (!createdNew)
+                return;
+        }
+        catch
+        {
+            return;
+        }
+
+        try
+        {
+            var exePath = Environment.ProcessPath
+                ?? Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrEmpty(exePath)) return;
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = exePath,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+        }
+        catch { }
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern bool DestroyIcon(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterApplicationRestart(string? commandLineArgs, int flags);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint UnregisterApplicationRestart();
 
     // ========== 深色菜单渲染器 ==========
     /// <summary>
